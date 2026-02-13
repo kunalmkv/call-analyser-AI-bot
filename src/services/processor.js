@@ -329,14 +329,34 @@ export const getHighPriorityCalls = async (limit = 50) => {
     }
 };
 
-// Main processing loop
-export const startProcessingLoop = async () => {
-    logger.info('Starting V5 call processing service...');
+/**
+ * Run a single processing job
+ * This is called by the scheduler or manual trigger
+ */
+export const runProcessingJob = async () => {
+    logger.info('Starting scheduled call processing job...');
 
-    await db.initDatabase();
+    const batchSize = 5;
+    const totalLimit = 5000; // Process all unprocessed calls (production setting)
 
-    // Create V2 table if it doesn't exist
     try {
+        const { totalProcessed, batchesCompleted } = await processSequentialBatches(batchSize, totalLimit);
+        logger.info(`Job completed: ${totalProcessed} calls processed in ${batchesCompleted} batches.`);
+        return { totalProcessed, batchesCompleted };
+    } catch (error) {
+        logger.error('Error during processing job:', error);
+        throw error;
+    }
+};
+
+/**
+ * Initialize database and preparation
+ */
+export const startProcessingLoop = async () => {
+    try {
+        await db.initDatabase();
+
+        // Ensure call_analysis_v2 exists
         await db.query(`
             CREATE TABLE IF NOT EXISTS call_analysis_v2 (
                 id SERIAL PRIMARY KEY,
@@ -375,26 +395,6 @@ export const startProcessingLoop = async () => {
             throw error;
         }
     }
-
-    const batchSize = 5;
-    const totalLimit = 10; // Testing with 10 calls first (will change to 5000 for production)
-
-    await processSequentialBatches(batchSize, totalLimit);
-
-    logger.info('V5 batch processing completed. Service will exit.');
-    await db.closeDatabase();
-
-    process.on('SIGINT', async () => {
-        logger.info('Shutting down gracefully...');
-        await db.closeDatabase();
-        process.exit(0);
-    });
-
-    process.on('SIGTERM', async () => {
-        logger.info('Shutting down gracefully...');
-        await db.closeDatabase();
-        process.exit(0);
-    });
 };
 
 // Manual processing function (for API endpoint)
