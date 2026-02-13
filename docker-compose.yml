@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: call_tagging_db
+    environment:
+      POSTGRES_USER: ${DB_USER:-callservice}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-callservice123}
+      POSTGRES_DB: ${DB_NAME:-call_center_db}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./src/database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-callservice}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - call_tagging_network
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: call_tagging_service
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-call_center_db}
+      DB_USER: ${DB_USER:-callservice}
+      DB_PASSWORD: ${DB_PASSWORD:-callservice123}
+      DB_SSL: false
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-anthropic/claude-3.5-sonnet}
+      BATCH_SIZE: ${BATCH_SIZE:-10}
+      PROCESSING_INTERVAL_MINUTES: ${PROCESSING_INTERVAL_MINUTES:-5}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "${API_PORT:-3000}:3000"
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - call_tagging_network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+
+networks:
+  call_tagging_network:
+    driver: bridge
