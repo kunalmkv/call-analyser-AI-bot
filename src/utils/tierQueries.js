@@ -75,18 +75,18 @@ export const getBillingDiscrepancies = async (limit = 50) => {
  */
 export const getUnbilledButBillable = async (limit = 100) => {
     const result = await db.query(
-        `SELECT 
+        `SELECT
             ringba_row_id,
             ringba_caller_id,
-            tier1_value,
-            tier5_value,
-            tier5_reason,
+            tier1_data->>'value'  AS tier1_value,
+            tier5_data->>'value'  AS tier5_value,
+            tier5_data->>'reason' AS tier5_reason,
             current_revenue,
             current_billed_status,
             call_summary,
             processed_at
          FROM call_analysis_v2
-         WHERE tier5_value IN ('LIKELY_BILLABLE', 'DEFINITELY_BILLABLE')
+         WHERE tier5_data->>'value' IN ('LIKELY_BILLABLE', 'DEFINITELY_BILLABLE')
            AND current_billed_status = false
            AND current_revenue = 0
          ORDER BY processed_at DESC
@@ -101,18 +101,18 @@ export const getUnbilledButBillable = async (limit = 100) => {
  */
 export const getBilledButNotBillable = async (limit = 100) => {
     const result = await db.query(
-        `SELECT 
+        `SELECT
             ringba_row_id,
             ringba_caller_id,
-            tier1_value,
-            tier5_value,
-            tier5_reason,
+            tier1_data->>'value'  AS tier1_value,
+            tier5_data->>'value'  AS tier5_value,
+            tier5_data->>'reason' AS tier5_reason,
             current_revenue,
             current_billed_status,
             call_summary,
             processed_at
          FROM call_analysis_v2
-         WHERE tier5_value = 'DEFINITELY_NOT_BILLABLE'
+         WHERE tier5_data->>'value' = 'DEFINITELY_NOT_BILLABLE'
            AND current_billed_status = true
            AND current_revenue > 0
          ORDER BY current_revenue DESC, processed_at DESC
@@ -194,11 +194,11 @@ export const searchCallSummaries = async (searchTerm, limit = 50) => {
  */
 export const getCallsByConfidence = async (minConfidence = 0, maxConfidence = 1, limit = 100) => {
     const result = await db.query(
-        `SELECT 
+        `SELECT
             ringba_row_id,
             ringba_caller_id,
-            tier1_value,
-            tier5_value,
+            tier1_data->>'value' AS tier1_value,
+            tier5_data->>'value' AS tier5_value,
             confidence_score,
             call_summary,
             processed_at

@@ -3,27 +3,104 @@ import { processBatch } from './openRouterClient.js';
 import logger from '../utils/logger.js';
 import config from '../config/index.js';
 
-// Save a single V5 tiered result to call_analysis_v2
-const saveV2Result = async (client, result) => {
+/** Collect all tag values from a V5 aiResponse for call_tags mapping. */
+const collectTierValuesFromResponse = (r) => {
+    const values = [];
+    const reasons = {};
+    if (r.tier1?.value) {
+        values.push(r.tier1.value);
+        if (r.tier1.reason) reasons[r.tier1.value] = r.tier1.reason;
+    }
+    if (r.tier4?.value) {
+        values.push(r.tier4.value);
+        if (r.tier4.reason) reasons[r.tier4.value] = r.tier4.reason;
+    }
+    if (r.tier5?.value) {
+        values.push(r.tier5.value);
+        if (r.tier5.reason) reasons[r.tier5.value] = r.tier5.reason;
+    }
+    for (const key of ['tier2', 'tier3', 'tier6', 'tier7', 'tier8', 'tier9', 'tier10']) {
+        const t = r[key];
+        if (Array.isArray(t?.values)) {
+            for (const v of t.values) {
+                if (v && typeof v === 'string') values.push(v);
+            }
+            if (t.reasons && typeof t.reasons === 'object') {
+                for (const [k, v] of Object.entries(t.reasons)) {
+                    if (k && v) reasons[k] = v;
+                }
+            }
+        }
+    }
+    return { values: [...new Set(values)], reasons };
+};
+
+/** Insert call_tags from V5 aiResponse using tag_value -> tag_id map.
+ *  Uses a single multi-row INSERT per call instead of one round-trip per tag. */
+const saveCallTagsFromV2Response = async (client, rowId, aiResponse, valueToTagId, confidenceScore) => {
+    if (!valueToTagId || valueToTagId.size === 0) return;
+    const { values, reasons } = collectTierValuesFromResponse(aiResponse || {});
+    const confidence = typeof confidenceScore === 'number' ? confidenceScore : 0.85;
+
+    // Build rows to insert (skip values not in tag map)
+    const rows = [];
+    for (const value of values) {
+        const tagId = valueToTagId.get(value);
+        if (tagId == null) continue;
+        rows.push({ tagId, reason: reasons[value] || null });
+    }
+    if (rows.length === 0) return;
+
+    // Single multi-row INSERT for the whole call
+    const valuePlaceholders = rows.map(
+        (_, i) => `($1, $${i * 2 + 2}, $${i * 2 + 3})`
+    ).join(', ');
+    const params = [rowId];
+    for (const { tagId } of rows) {
+        params.push(tagId, confidence);
+    }
+    await client.query(
+        `INSERT INTO call_tags (call_id, tag_id, confidence)
+         VALUES ${valuePlaceholders}
+         ON CONFLICT (call_id, tag_id) DO UPDATE
+         SET confidence = EXCLUDED.confidence`,
+        params
+    );
+};
+
+// Save a single V5 tiered result to call_analysis_v2 (main) + call_analysis_v2_raw (debug blob).
+//
+// ALL tiers use only tierN_data JSONB — no separate _value columns anywhere:
+//   • Single-value tiers (1, 4, 5): {"value":"…", "reason":"…"}
+//   • Array tiers (2, 3, 6–10):     {"values":[…], "reasons":{…}}
+const saveV2Result = async (client, result, callTimestamp = null) => {
     const { rowId, aiResponse, processingTimeMs, modelUsed } = result;
     const r = aiResponse;
+
+    // Build JSONB for single-value tiers: {"value":"…","reason":"…"}
+    const svData = (tier) => JSON.stringify({
+        value:  tier?.value  ?? null,
+        reason: tier?.reason ?? null,
+    });
+
+    // Build JSONB for array tiers: {"values":[…],"reasons":{…}}
+    const arrData = (tier) => JSON.stringify(tier || { values: [], reasons: {} });
 
     await client.query(
         `INSERT INTO call_analysis_v2 (
             ringba_row_id,
             ringba_caller_id,
-            tier1_value,
-            tier1_reason,
+            call_timestamp,
+            tier1_data,
             tier2_data,
             tier3_data,
-            tier4_value,
-            tier4_reason,
-            tier5_value,
-            tier5_reason,
+            tier4_data,
+            tier5_data,
             tier6_data,
             tier7_data,
             tier8_data,
             tier9_data,
+            tier10_data,
             confidence_score,
             dispute_recommendation,
             dispute_recommendation_reason,
@@ -32,120 +109,158 @@ const saveV2Result = async (client, result) => {
             system_duplicate,
             current_revenue,
             current_billed_status,
-            raw_ai_response,
             processing_time_ms,
             model_used
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-            $11, $12, $13, $14, $15, $16, $17, $18, $19,
-            $20, $21, $22, $23, $24, $25
+            $1,  $2,  $3,  $4,  $5,  $6,  $7,  $8,
+            $9,  $10, $11, $12, $13, $14, $15, $16,
+            $17, $18, $19, $20, $21, $22, $23
         )
         ON CONFLICT (ringba_row_id) DO UPDATE SET
-            ringba_caller_id = EXCLUDED.ringba_caller_id,
-            tier1_value = EXCLUDED.tier1_value,
-            tier1_reason = EXCLUDED.tier1_reason,
-            tier2_data = EXCLUDED.tier2_data,
-            tier3_data = EXCLUDED.tier3_data,
-            tier4_value = EXCLUDED.tier4_value,
-            tier4_reason = EXCLUDED.tier4_reason,
-            tier5_value = EXCLUDED.tier5_value,
-            tier5_reason = EXCLUDED.tier5_reason,
-            tier6_data = EXCLUDED.tier6_data,
-            tier7_data = EXCLUDED.tier7_data,
-            tier8_data = EXCLUDED.tier8_data,
-            tier9_data = EXCLUDED.tier9_data,
-            confidence_score = EXCLUDED.confidence_score,
-            dispute_recommendation = EXCLUDED.dispute_recommendation,
+            ringba_caller_id              = EXCLUDED.ringba_caller_id,
+            call_timestamp                = EXCLUDED.call_timestamp,
+            tier1_data                    = EXCLUDED.tier1_data,
+            tier2_data                    = EXCLUDED.tier2_data,
+            tier3_data                    = EXCLUDED.tier3_data,
+            tier4_data                    = EXCLUDED.tier4_data,
+            tier5_data                    = EXCLUDED.tier5_data,
+            tier6_data                    = EXCLUDED.tier6_data,
+            tier7_data                    = EXCLUDED.tier7_data,
+            tier8_data                    = EXCLUDED.tier8_data,
+            tier9_data                    = EXCLUDED.tier9_data,
+            tier10_data                   = EXCLUDED.tier10_data,
+            confidence_score              = EXCLUDED.confidence_score,
+            dispute_recommendation        = EXCLUDED.dispute_recommendation,
             dispute_recommendation_reason = EXCLUDED.dispute_recommendation_reason,
-            call_summary = EXCLUDED.call_summary,
-            extracted_customer_info = EXCLUDED.extracted_customer_info,
-            system_duplicate = EXCLUDED.system_duplicate,
-            current_revenue = EXCLUDED.current_revenue,
-            current_billed_status = EXCLUDED.current_billed_status,
-            raw_ai_response = EXCLUDED.raw_ai_response,
-            processing_time_ms = EXCLUDED.processing_time_ms,
-            model_used = EXCLUDED.model_used,
-            processed_at = NOW()`,
+            call_summary                  = EXCLUDED.call_summary,
+            extracted_customer_info       = EXCLUDED.extracted_customer_info,
+            system_duplicate              = EXCLUDED.system_duplicate,
+            current_revenue               = EXCLUDED.current_revenue,
+            current_billed_status         = EXCLUDED.current_billed_status,
+            processing_time_ms            = EXCLUDED.processing_time_ms,
+            model_used                    = EXCLUDED.model_used,
+            processed_at                  = NOW()`,
         [
-            rowId,
-            r.ringbaCallerId || null,
-            r.tier1?.value || 'UNKNOWN',
-            r.tier1?.reason || null,
-            JSON.stringify(r.tier2 || { values: [], reasons: {} }),
-            JSON.stringify(r.tier3 || { values: [], reasons: {} }),
-            r.tier4?.value || 'UNKNOWN_APPLIANCE',
-            r.tier4?.reason || null,
-            r.tier5?.value || 'QUESTIONABLE_BILLING',
-            r.tier5?.reason || null,
-            JSON.stringify(r.tier6 || { values: [], reasons: {} }),
-            JSON.stringify(r.tier7 || { values: [], reasons: {} }),
-            JSON.stringify(r.tier8 || { values: [], reasons: {} }),
-            JSON.stringify(r.tier9 || { values: [], reasons: {} }),
-            r.confidence_score || 0.5,
-            r.dispute_recommendation || 'NONE',
-            r.dispute_recommendation_reason || null,
-            r.call_summary || '',
-            JSON.stringify(r.extracted_customer_info || {}),
-            r.system_duplicate || false,
-            r.current_revenue || 0,
-            r.current_billed_status || false,
-            JSON.stringify(r),
-            processingTimeMs,
-            modelUsed
+            rowId,                                   // $1
+            r.ringbaCallerId || null,                // $2
+            callTimestamp,                           // $3
+            svData(r.tier1),                         // $4  {"value":"…","reason":"…"}
+            arrData(r.tier2),                        // $5  {"values":[…],"reasons":{…}}
+            arrData(r.tier3),                        // $6
+            svData(r.tier4),                         // $7
+            svData(r.tier5),                         // $8
+            arrData(r.tier6),                        // $9
+            arrData(r.tier7),                        // $10
+            arrData(r.tier8),                        // $11
+            arrData(r.tier9),                        // $12
+            arrData(r.tier10),                       // $13
+            r.confidence_score || 0.5,               // $14
+            r.dispute_recommendation || 'NONE',      // $15
+            r.dispute_recommendation_reason || null, // $16
+            r.call_summary || '',                    // $17
+            JSON.stringify(r.extracted_customer_info || {}), // $18
+            r.system_duplicate || false,             // $19
+            r.current_revenue || 0,                  // $20
+            r.current_billed_status || false,        // $21
+            processingTimeMs,                        // $22
+            modelUsed                                // $23
         ]
+    );
+
+    // Store raw debug blob in separate table to avoid bloating the main table
+    await client.query(
+        `INSERT INTO call_analysis_v2_raw (ringba_row_id, raw_ai_response)
+         VALUES ($1, $2)
+         ON CONFLICT (ringba_row_id) DO UPDATE
+         SET raw_ai_response = EXCLUDED.raw_ai_response, stored_at = NOW()`,
+        [rowId, JSON.stringify(r)]
     );
 };
 
 // Fetch unprocessed rows with all fields needed for V5 prompt
-// FILTER: Only fetches calls from 2026-02-13 onwards (fresh calls only)
+// FILTER: Only fetches calls on or after 1 Feb 2026 (call_timestamp >= 2026-02-01)
 const fetchUnprocessedRows = async (limit) => {
     return db.query(
         `SELECT
-            id,
-            "inboundCallId",
-            "inboundCallId" as ringba_caller_id,
-            transcript,
+            r.id,
+            r.ringba_id as "inboundCallId",
+            r.ringba_id as ringba_caller_id,
+            r.transcript,
             REGEXP_REPLACE(
-                REGEXP_REPLACE(transcript, '^A\\s*-\\s*', 'Agent: ', 'gm'),
+                REGEXP_REPLACE(r.transcript, '^A\\s*-\\s*', 'Agent: ', 'gm'),
                 '^B\\s*-\\s*', 'Customer: ', 'gm'
             ) as transcription,
             CASE
-                WHEN "callLengthInSeconds" ~ '^[0-9]+$'
-                THEN "callLengthInSeconds"::integer
+                WHEN r.call_duration ~ '^[0-9]+$'
+                THEN r.call_duration::integer
                 ELSE NULL
             END as duration,
-            "phoneNumber" as caller_phone,
-            revenue,
-            "g_zip",
+            r.caller_id as caller_phone,
+            COALESCE(e.elocal_payout, 0) as revenue,
+            r.g_zip,
             FALSE as is_duplicate,
             NULL as hung_up,
-            "firstName",
-            "lastName",
-            address,
-            street_number,
-            street_name,
-            street_type,
-            city,
-            state,
-            "targetName",
-            "publisherName",
-            billed,
-            COALESCE(call_timestamp, CURRENT_TIMESTAMP) as call_date
-         FROM ringba_call_data
-         WHERE transcript IS NOT NULL
-         AND transcript != ''
-         AND (ai_processed = false OR ai_processed IS NULL)
-         AND call_timestamp >= '2026-02-13'::date
-         ORDER BY id ASC
+            r."firstName",
+            r."lastName",
+            r.address,
+            r.street_number,
+            r.street_name,
+            r.street_type,
+            r.city,
+            r.state,
+            r."targetName",
+            r."publisherName",
+            r.billed,
+            COALESCE(r.call_timestamp, CURRENT_TIMESTAMP) as call_date,
+            r.campaign_id
+         FROM ringba_call_data r
+         LEFT JOIN elocal_call_data e ON r.ringba_id = e.ringba_id
+         INNER JOIN campaigns c ON r.campaign_id = c.campaign_id AND c.ai_enabled = TRUE
+         WHERE r.transcript IS NOT NULL
+         AND r.transcript != ''
+         AND (r.ai_processed = false OR r.ai_processed IS NULL)
+         AND r.call_timestamp >= '2026-02-01'::date
+         ORDER BY r.id ASC
          LIMIT $1`,
         [limit]
     );
 };
 
+// Build prompt lookup from campaign_prompts table. No global default — only campaign-specific prompts.
+// Returns { map: Map<campaignId, promptText> }
+const loadPrompts = async () => {
+    const rows = await db.getActivePrompts();
+    const map = new Map();
+    for (const row of rows) {
+        if (row.campaign_id != null) {
+            map.set(row.campaign_id, row.system_prompt);
+        }
+    }
+    logger.info(`Loaded ${map.size} campaign prompt(s) from campaign_prompts (no global default)`);
+    return { map };
+};
+
+// Resolve system prompt for a row. Only campaign-specific; no fallback. Returns undefined if no prompt.
+const getPromptForRow = (row, map) => map.get(row.campaign_id);
+
 // Process multiple batches sequentially
 const processSequentialBatches = async (batchSize, totalLimit) => {
     let totalProcessed = 0;
     let batchNumber = 1;
+
+    // Load tag definitions for call_tags mapping (tag_value -> tag_id)
+    const tagDefinitions = await db.getTagDefinitions();
+    const valueToTagId = new Map();
+    for (const t of tagDefinitions) {
+        if (t.tag_value) valueToTagId.set(t.tag_value, t.id);
+    }
+    logger.info(`Loaded ${valueToTagId.size} tag_definitions with tag_value for call_tags mapping`);
+
+    // Load campaign prompts once — only campaign-specific; no global default
+    const { map: promptMap } = await loadPrompts();
+    if (promptMap.size === 0) {
+        throw new Error('No campaign prompts available. Add prompts via API or scripts (e.g. scripts/seed-appliance-repair-prompt.js).');
+    }
 
     logger.info(`Starting V5 batch processing: ${totalLimit} total calls in batches of ${batchSize}`);
 
@@ -168,8 +283,32 @@ const processSequentialBatches = async (batchSize, totalLimit) => {
             logger.info(`Fetched ${rows.length} rows for batch ${batchNumber}`);
             logger.info(`Row IDs: ${rows.map(t => t.id).join(', ')}`);
 
-            // Process with AI (V5 prompt - no tag definitions needed)
-            const { successful, failed } = await processBatch(rows);
+            // Group rows by resolved prompt so prompt-caching is maximally effective.
+            // Only process rows whose campaign has an active prompt (no global fallback).
+            const promptGroups = new Map(); // promptText → row[]
+            let skippedNoPrompt = 0;
+            for (const row of rows) {
+                const prompt = getPromptForRow(row, promptMap);
+                if (!prompt) {
+                    skippedNoPrompt++;
+                    continue;
+                }
+                if (!promptGroups.has(prompt)) promptGroups.set(prompt, []);
+                promptGroups.get(prompt).push(row);
+            }
+            if (skippedNoPrompt > 0) {
+                logger.info(`Skipped ${skippedNoPrompt} row(s) with no campaign prompt for this batch`);
+            }
+            logger.info(`Prompt groups for batch ${batchNumber}: ${promptGroups.size} unique prompt(s)`);
+
+            // Process all groups — collect into flat successful/failed arrays
+            const successful = [];
+            const failed = [];
+            for (const [prompt, groupRows] of promptGroups) {
+                const result = await processBatch(groupRows, prompt);
+                successful.push(...result.successful);
+                failed.push(...result.failed);
+            }
 
             logger.info(`Batch ${batchNumber} AI complete: ${successful.length} successful, ${failed.length} failed`);
 
@@ -177,9 +316,20 @@ const processSequentialBatches = async (batchSize, totalLimit) => {
             let savedInBatch = 0;
             for (const result of successful) {
                 try {
+                    const row = rows.find((r) => r.id === result.rowId);
+                    const callTimestamp = row?.call_date ?? null;
                     await db.withTransaction(async (client) => {
-                        // Save V5 tiered analysis
-                        await saveV2Result(client, result);
+                        // Save V5 tiered analysis (include call timestamp from source row)
+                        await saveV2Result(client, result, callTimestamp);
+
+                        // Save call_tags from tier values (tag_value -> tag_id)
+                        await saveCallTagsFromV2Response(
+                            client,
+                            result.rowId,
+                            result.aiResponse,
+                            valueToTagId,
+                            result.aiResponse?.confidence_score
+                        );
 
                         // Mark as processed in ringba_call_data
                         await client.query(
@@ -233,61 +383,11 @@ const processSequentialBatches = async (batchSize, totalLimit) => {
     return { totalProcessed, batchesCompleted: batchNumber - 1 };
 };
 
-// Generate analytics report from V2 data
+// Generate analytics report from V2 data (delegates to the shared CTE query in dbOperations)
 export const generateAnalyticsReport = async (startDate, endDate) => {
     try {
-        const report = await db.queryOne(
-            `SELECT json_build_object(
-                'period', json_build_object('start', $1, 'end', $2),
-                'total_calls', (
-                    SELECT COUNT(*) FROM call_analysis_v2
-                    WHERE processed_at BETWEEN $1 AND $2
-                ),
-                'tier1_breakdown', (
-                    SELECT json_agg(row_to_json(t))
-                    FROM (
-                        SELECT tier1_value, COUNT(*) as count
-                        FROM call_analysis_v2
-                        WHERE processed_at BETWEEN $1 AND $2
-                        GROUP BY tier1_value ORDER BY count DESC
-                    ) t
-                ),
-                'tier5_breakdown', (
-                    SELECT json_agg(row_to_json(t))
-                    FROM (
-                        SELECT tier5_value, COUNT(*) as count,
-                               AVG(current_revenue) as avg_revenue
-                        FROM call_analysis_v2
-                        WHERE processed_at BETWEEN $1 AND $2
-                        GROUP BY tier5_value ORDER BY count DESC
-                    ) t
-                ),
-                'tier4_breakdown', (
-                    SELECT json_agg(row_to_json(t))
-                    FROM (
-                        SELECT tier4_value, COUNT(*) as count
-                        FROM call_analysis_v2
-                        WHERE processed_at BETWEEN $1 AND $2
-                        GROUP BY tier4_value ORDER BY count DESC
-                    ) t
-                ),
-                'dispute_breakdown', (
-                    SELECT json_agg(row_to_json(t))
-                    FROM (
-                        SELECT dispute_recommendation, COUNT(*) as count
-                        FROM call_analysis_v2
-                        WHERE processed_at BETWEEN $1 AND $2
-                        GROUP BY dispute_recommendation ORDER BY count DESC
-                    ) t
-                ),
-                'avg_confidence', (
-                    SELECT AVG(confidence_score) FROM call_analysis_v2
-                    WHERE processed_at BETWEEN $1 AND $2
-                )
-            ) as report`,
-            [startDate, endDate]
-        );
-        return report?.report || {};
+        const result = await db.getAnalyticsData(startDate, endDate);
+        return result?.report || {};
     } catch (error) {
         logger.error('Failed to generate analytics report:', error);
         throw error;
@@ -301,8 +401,8 @@ export const getHighPriorityCalls = async (limit = 50) => {
             `SELECT
                 ringba_row_id,
                 ringba_caller_id,
-                tier1_value,
-                tier5_value,
+                tier1_data->>'value'  AS tier1_value,
+                tier5_data->>'value'  AS tier5_value,
                 dispute_recommendation,
                 dispute_recommendation_reason,
                 call_summary,
@@ -312,7 +412,7 @@ export const getHighPriorityCalls = async (limit = 50) => {
                 processed_at
              FROM call_analysis_v2
              WHERE dispute_recommendation IN ('REVIEW', 'STRONG')
-                OR tier5_value = 'DEFINITELY_NOT_BILLABLE'
+                OR tier5_data->>'value' = 'DEFINITELY_NOT_BILLABLE'
              ORDER BY
                 CASE dispute_recommendation
                     WHEN 'STRONG' THEN 1
@@ -356,40 +456,54 @@ export const startProcessingLoop = async () => {
     try {
         await db.initDatabase();
 
-        // Ensure call_analysis_v2 exists
+        // Ensure call_analysis_v2 exists (fresh-install DDL — run migrate-*.js for upgrades).
+        // Tier uniformity layout:
+        //   • Single-value tiers 1/4/5: tierN_value (indexed), tierN_data = {"value":"…","reason":"…"}
+        //   • Array tiers 2/3/6-10: tierN_data = {"values":[…],"reasons":{…}},
+        //                            tierN_value = GENERATED from tierN_data
         await db.query(`
             CREATE TABLE IF NOT EXISTS call_analysis_v2 (
-                id SERIAL PRIMARY KEY,
-                ringba_row_id INTEGER NOT NULL,
+                ringba_row_id    INTEGER NOT NULL PRIMARY KEY,
                 ringba_caller_id VARCHAR(200),
-                tier1_value VARCHAR(50) NOT NULL,
-                tier1_reason TEXT,
-                tier2_data JSONB DEFAULT '{"values":[],"reasons":{}}',
-                tier3_data JSONB DEFAULT '{"values":[],"reasons":{}}',
-                tier4_value VARCHAR(50),
-                tier4_reason TEXT,
-                tier5_value VARCHAR(50),
-                tier5_reason TEXT,
-                tier6_data JSONB DEFAULT '{"values":[],"reasons":{}}',
-                tier7_data JSONB DEFAULT '{"values":[],"reasons":{}}',
-                tier8_data JSONB DEFAULT '{"values":[],"reasons":{}}',
-                tier9_data JSONB DEFAULT '{"values":[],"reasons":{}}',
-                confidence_score DECIMAL(3,2),
-                dispute_recommendation VARCHAR(20) DEFAULT 'NONE',
+                call_timestamp   TIMESTAMPTZ,
+
+                -- ALL tiers use only tierN_data JSONB — no separate _value shortcut columns.
+                -- Single-value tiers (1,4,5): {"value":"…","reason":"…"}
+                -- Array tiers (2,3,6-10):     {"values":[…],"reasons":{…}}
+                tier1_data  JSONB NOT NULL DEFAULT '{"value":"UNKNOWN","reason":null}',
+                tier2_data  JSONB NOT NULL DEFAULT '{"values":[],"reasons":{}}',
+                tier3_data  JSONB NOT NULL DEFAULT '{"values":[],"reasons":{}}',
+                tier4_data  JSONB NOT NULL DEFAULT '{"value":null,"reason":null}',
+                tier5_data  JSONB NOT NULL DEFAULT '{"value":null,"reason":null}',
+                tier6_data  JSONB NOT NULL DEFAULT '{"values":[],"reasons":{}}',
+                tier7_data  JSONB NOT NULL DEFAULT '{"values":[],"reasons":{}}',
+                tier8_data  JSONB NOT NULL DEFAULT '{"values":[],"reasons":{}}',
+                tier9_data  JSONB NOT NULL DEFAULT '{"values":[],"reasons":{}}',
+                tier10_data JSONB NOT NULL DEFAULT '{"values":[],"reasons":{}}',
+
+                confidence_score              DECIMAL(3,2),
+                dispute_recommendation        VARCHAR(20) NOT NULL DEFAULT 'NONE',
                 dispute_recommendation_reason TEXT,
-                call_summary TEXT,
-                extracted_customer_info JSONB DEFAULT '{}',
-                system_duplicate BOOLEAN DEFAULT FALSE,
-                current_revenue DECIMAL(10,2),
-                current_billed_status BOOLEAN,
-                raw_ai_response JSONB,
-                processing_time_ms INTEGER,
-                model_used VARCHAR(100),
-                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(ringba_row_id)
+                call_summary                  TEXT NOT NULL DEFAULT '',
+                extracted_customer_info       JSONB NOT NULL DEFAULT '{}',
+                system_duplicate              BOOLEAN NOT NULL DEFAULT FALSE,
+                current_revenue               DECIMAL(10,2),
+                current_billed_status         BOOLEAN NOT NULL DEFAULT FALSE,
+                processing_time_ms            INTEGER,
+                model_used                    VARCHAR(100),
+                processed_at                  TIMESTAMPTZ DEFAULT NOW()
             )
         `);
-        logger.info('call_analysis_v2 table ready');
+        // Separate table for raw debug blobs — keeps main table lean
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS call_analysis_v2_raw (
+                ringba_row_id INTEGER PRIMARY KEY
+                    REFERENCES call_analysis_v2(ringba_row_id) ON DELETE CASCADE,
+                raw_ai_response JSONB NOT NULL,
+                stored_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+        logger.info('call_analysis_v2 + call_analysis_v2_raw tables ready');
     } catch (error) {
         if (!error.message.includes('already exists')) {
             throw error;

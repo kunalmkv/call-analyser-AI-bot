@@ -53,12 +53,12 @@ const exporters = {
                 td.priority,
                 td.tag_name,
                 td.importance,
-                COUNT(ct.id) as usage_count,
-                AVG(ct.confidence) as avg_confidence,
-                MIN(ct.confidence) as min_confidence,
-                MAX(ct.confidence) as max_confidence
-            FROM tag_definitions td
-            LEFT JOIN call_tags ct ON td.id = ct.tag_id
+            COUNT(ct.call_id) AS usage_count,
+            AVG(ct.confidence)  AS avg_confidence,
+            MIN(ct.confidence)  AS min_confidence,
+            MAX(ct.confidence)  AS max_confidence
+        FROM tag_definitions td
+        LEFT JOIN call_tags ct ON td.id = ct.tag_id
             LEFT JOIN call_analysis ca ON ct.call_id = ca.id
             WHERE ca.processed_at BETWEEN $1 AND $2 OR ca.processed_at IS NULL
             GROUP BY td.id, td.priority, td.tag_name, td.importance
@@ -113,7 +113,7 @@ const exporters = {
                 ) FILTER (WHERE td.priority IN ('Highest', 'High')) as critical_tags
             FROM call_analysis ca
             JOIN call_transcriptions ct ON ca.id = ct.call_id
-            JOIN call_tags tags ON ca.id = tags.call_id
+            JOIN v_call_tags_with_reasons tags ON ca.id = tags.call_id
             JOIN tag_definitions td ON tags.tag_id = td.id
             WHERE td.priority IN ('Highest', 'High')
             AND tags.confidence > 0.7
@@ -161,7 +161,7 @@ const exporters = {
                 SELECT 
                     td.tag_name,
                     td.priority,
-                    COUNT(ct.id) as count
+                    COUNT(*) AS count
                 FROM call_tags ct
                 JOIN tag_definitions td ON ct.tag_id = td.id
                 JOIN call_analysis ca ON ct.call_id = ca.id

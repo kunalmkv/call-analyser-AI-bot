@@ -82,22 +82,20 @@ async function processNext20Calls() {
                             // Save tags
                             if (result.tags.length > 0) {
                                 const tagValues = result.tags.map((tag, index) => 
-                                    `($${index * 4 + 1}, $${index * 4 + 2}, $${index * 4 + 3}, $${index * 4 + 4})`
+                                    `($${index * 3 + 1}, $${index * 3 + 2}, $${index * 3 + 3})`
                                 ).join(',');
                                 
                                 const tagParams = result.tags.flatMap(tag => [
                                     result.callId,
                                     tag.tagId,
-                                    tag.confidence,
-                                    tag.reason
+                                    tag.confidence
                                 ]);
                                 
                                 await client.query(
-                                    `INSERT INTO call_tags (call_id, tag_id, confidence, detected_reason)
+                                    `INSERT INTO call_tags (call_id, tag_id, confidence)
                                      VALUES ${tagValues}
                                      ON CONFLICT (call_id, tag_id) DO UPDATE 
-                                     SET confidence = EXCLUDED.confidence,
-                                         detected_reason = EXCLUDED.detected_reason`,
+                                     SET confidence = EXCLUDED.confidence`,
                                     tagParams
                                 );
                             }

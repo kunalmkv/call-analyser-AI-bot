@@ -7,7 +7,7 @@ const RESPONSE_SCHEMA = {
     type: 'object',
     required: [
         'ringbaCallerId', 'tier1', 'tier2', 'tier3', 'tier4', 'tier5',
-        'tier6', 'tier7', 'tier8', 'tier9',
+        'tier6', 'tier7', 'tier8', 'tier9', 'tier10',
         'confidence_score', 'dispute_recommendation', 'call_summary',
         'extracted_customer_info', 'system_duplicate', 'current_revenue',
         'current_billed_status'
@@ -162,7 +162,25 @@ const RESPONSE_SCHEMA = {
                     type: 'array',
                     items: {
                         type: 'string',
-                        enum: ['DIY_ATTEMPT_FAILED', 'INSURANCE_CLAIM_RELATED']
+                        enum: ['DIY_ATTEMPT_FAILED', 'INSURANCE_CLAIM_RELATED', 'PARTS_INQUIRY', 'CONSIDERING_NEW_PURCHASE']
+                    }
+                },
+                reasons: {
+                    type: 'object',
+                    additionalProperties: { type: 'string' }
+                }
+            }
+        },
+        tier10: {
+            type: 'object',
+            required: ['values', 'reasons'],
+            additionalProperties: false,
+            properties: {
+                values: {
+                    type: 'array',
+                    items: {
+                        type: 'string',
+                        enum: ['BUYER_AVAILABILITY_ISSUE', 'BUYER_ROUTING_FAILURE']
                     }
                 },
                 reasons: {
@@ -188,141 +206,38 @@ const RESPONSE_SCHEMA = {
     }
 };
 
-// V5 Optimized System Prompt — output schema section removed (enforced via json_schema)
-const SYSTEM_PROMPT = `You are a call analyst for an affiliate lead generation company selling appliance repair leads to buyers. Analyze call transcripts and tag them to optimize ad spend, manage buyer relationships, and support dispute resolution.
-
-BUSINESS MODEL (affiliate lead gen):
-- Multiple calls from same consumer to different buyers = GOOD (multiple revenue streams)
-- Consumer shopping around / calling competitors = NORMAL, not a problem
-- Brand bidding = consumer searching for brands is EXPECTED
-- Only flag TRUE quality issues: unserviceable areas, technical failures, confirmed wrong service
-- Disputes happen at BUYER level 7-14 days later, not proactively
-
-BILLING RULES:
-- Buyer engages + provides service + >60s = BILLABLE (even without appointment)
-- Appointment booked = ALWAYS billable (even if <60s, as long as >45s)
-- <40s with no value = NOT billable
-- 40-60s unclear = QUESTIONABLE (unless appointment booked)
-
-OUTPUT: Return ONLY valid JSON matching the provided schema. No markdown, no preamble.
-
-=== TAG DEFINITIONS ===
-
-TIER 1 - PRIMARY OUTCOME (exactly 1):
-QUALIFIED_APPOINTMENT_SET: Firm appointment with date/time confirmed, address collected
-SOFT_LEAD_INTERESTED: Interested but no commitment ("call back", "check with spouse", got pricing)
-INFORMATION_ONLY_CALL: Got info, unlikely to convert (warranty Q only, price check, no follow-up)
-BUYER_EARLY_HANGUP: Buyer disconnected prematurely (hung_up="Target", technical issues, "can't help")
-USER_EARLY_HANGUP: Consumer disconnected prematurely (hung_up="Caller", <30s, wrong number)
-NO_BUYER_INTEREST: Buyer explicitly refused service, ended without helping
-
-TIER 2 - QUALITY FLAGS (array, all that apply):
-WRONG_NUMBER: Wanted different company/brand. DATA POINT ONLY - expected in brand campaigns. NEVER auto-dispute. Can still be billable if buyer helps.
-UNSERVICEABLE_GEOGRAPHY: Buyer can't service location. Dispute=STRONG.
-UNSERVICEABLE_APPLIANCE_[TYPE]: Buyer doesn't service this appliance (specify: TV, COMMERCIAL, HVAC, POOL, OTHER). Dispute=STRONG.
-BUYER_AVAILABILITY_ISSUE: No agents / closed during hours. Buyer's fault, not routing.
-BUYER_ROUTING_FAILURE: Technical issue, IVR 60+ sec hold, transfer failed.
-IMMEDIATE_DISCONNECT: <10 seconds, no conversation. Never billable. Dispute=STRONG.
-POSSIBLE_DISPUTE: Soft flag for borderline cases. Review only IF buyer disputes.
-
-TIER 3 - CUSTOMER INTENT (array, all that apply):
-URGENT_REPAIR_NEEDED: "Not working", "need someone today", emergency
-PREVENTIVE_MAINTENANCE: "Making noises", "want it checked", no urgency
-WARRANTY_CLAIM_ATTEMPT: "Under warranty?", "bought 3 months ago" (intent, not outcome)
-PRICE_COMPARISON_SHOPPING: "How much?", multiple cost questions, no urgency
-CONSIDERING_NEW_PURCHASE: "Should I buy new?", "worth fixing?"
-PARTS_INQUIRY: "Sell parts?", "need replacement motor", wants DIY
-
-TIER 4 - APPLIANCE TYPE (exactly 1):
-WASHER_REPAIR | DRYER_REPAIR | REFRIGERATOR_REPAIR | DISHWASHER_REPAIR | OVEN_STOVE_REPAIR | MICROWAVE_REPAIR | GARBAGE_DISPOSAL_REPAIR | MULTIPLE_APPLIANCES | UNKNOWN_APPLIANCE | UNSERVICED_APPLIANCE_[TYPE]
-
-TIER 5 - BILLING INDICATOR (exactly 1):
-LIKELY_BILLABLE: >60s meaningful conversation OR appointment booked (even if <60s, >45s) OR detailed qualification
-QUESTIONABLE_BILLING: 40-60s, unclear outcome (EXCEPTION: appointment = LIKELY)
-DEFINITELY_NOT_BILLABLE: <40s OR IMMEDIATE_DISCONNECT OR major quality flag OR NO_BUYER_INTEREST
-CRITICAL: Reason MUST start with "Currently billed at $X (billed=true/false). Duration Xs..."
-
-TIER 6 - CUSTOMER DEMOGRAPHICS (array, can be empty):
-ELDERLY_CUSTOMER | RENTAL_PROPERTY_OWNER | FIRST_TIME_HOMEOWNER | MULTILINGUAL_CUSTOMER | COMMERCIAL_PROPERTY
-
-TIER 7 - BUYER PERFORMANCE (array, can be empty):
-EXCELLENT_BUYER_SERVICE: Professional, qualified well, attempted close
-POOR_BUYER_SERVICE: Rude, unhelpful, unprofessional
-BUYER_MISSED_OPPORTUNITY: Customer ready but buyer didn't close
-
-TIER 8 - TRAFFIC QUALITY (array, can be empty):
-HIGH_INTENT_TRAFFIC: Ready-to-buy signals, urgent need, decision-maker
-BRAND_CONFUSION_TRAFFIC: Wanted manufacturer (expected in brand campaigns, NOT a problem)
-CONSUMER_SHOPPING_MULTIPLE: Called other companies (NORMAL, NOT a problem)
-
-TIER 9 - SPECIAL SITUATIONS (array, can be empty):
-DIY_ATTEMPT_FAILED: Tried fixing themselves, may be more complex
-INSURANCE_CLAIM_RELATED: Insurance involved, different timeline
-
-=== DECISION RULES ===
-
-Primary outcome:
-- Appointment with date/time confirmed -> QUALIFIED_APPOINTMENT_SET
-- Interested, no commitment -> SOFT_LEAD_INTERESTED
-- <30s + hung_up="Target" -> BUYER_EARLY_HANGUP
-- <30s + hung_up="Caller" -> USER_EARLY_HANGUP
-- Buyer refused to help -> NO_BUYER_INTEREST
-- Otherwise -> INFORMATION_ONLY_CALL
-
-Brand name mentioned:
-- Tag WRONG_NUMBER + BRAND_CONFUSION_TRAFFIC
-- If buyer still helped -> assess billing normally. If not -> NO_BUYER_INTEREST
-- Dispute: NONE (expected from brand campaigns)
-
-"I called before":
-- If BUYER recognizes and refuses -> NO_BUYER_INTEREST + POSSIBLE_DISPUTE
-- Otherwise -> CONSUMER_SHOPPING_MULTIPLE, assess normally
-
-=== CUSTOMER INFO EXTRACTION ===
-
-Extract from transcript: firstName, lastName, address, street_number, street_name, street_type, city, state, g_zip
-Output ONLY fields that differ from input OR were null/missing in input. If no differences, return empty object {}.
-
-=== IMPORTANT RULES ===
-
-- ringbaCallerId: copy exactly from input
-- dispute_recommendation_reason: ONLY include if REVIEW or STRONG, use empty string for NONE
-- Reasons must be SPECIFIC and CONTEXTUAL, not generic
-- WRONG_NUMBER is NEVER a dispute trigger by itself
-
-=== COMMON MISTAKES TO AVOID ===
-
-- DO NOT auto-dispute WRONG_NUMBER
-- DO NOT tag consumer shopping around as a problem
-- DO NOT write generic reasons like "customer was interested" - cite specific transcript evidence
-- DO NOT forget revenue context in tier5 reason
-- DO NOT output customer info that matches input - only differences/nulls
-- DO NOT treat short appointment calls as QUESTIONABLE - appointment = LIKELY_BILLABLE if >45s`;
-
 // Build the user prompt with all call data as JSON
 const createUserPrompt = (callData) => {
     return `Analyze this call:\n\n${JSON.stringify(callData)}`;
 };
 
-// Build call data object from raw DB row for the prompt
+// Build call data object from raw DB row for the prompt.
+// Must match SECTION 2 (INPUT DATA SPECIFICATION) in CALL_TAGGING_SYSTEM_PROMPT_V5.md.
 export const buildCallData = (row) => {
     const callData = {
+        // Required - copy exactly to output
         ringbaCallerId: row.ringba_caller_id || row.inboundCallId || `ROW_${row.id}`,
+        // Consumer phone number
+        callerId: row.caller_phone ?? row.callerId ?? null,
         transcript: row.transcription || row.transcript || '',
         callLengthInSeconds: parseInt(row.duration || row.callLengthInSeconds || 0, 10),
         revenue: parseFloat(row.revenue || 0),
-        billed: parseFloat(row.revenue || 0) > 0,
+        billed: row.billed !== undefined ? Boolean(row.billed) : (parseFloat(row.revenue || 0) > 0),
         hung_up: row.hung_up || 'Unknown',
         duplicate: row.isDuplicate === true || row.isDuplicate === 'true',
-        firstName: row.firstName || null,
-        lastName: row.lastName || null,
-        address: row.address || null,
-        street_number: row.street_number || null,
-        street_name: row.street_name || null,
-        street_type: row.street_type || null,
-        city: row.city || null,
-        state: row.state || null,
-        g_zip: row.g_zip || null,
+        // Customer info (may be null)
+        firstName: row.firstName ?? null,
+        lastName: row.lastName ?? null,
+        address: row.address ?? null,
+        street_number: row.street_number ?? null,
+        street_name: row.street_name ?? null,
+        street_type: row.street_type ?? null,
+        city: row.city ?? null,
+        state: row.state ?? null,
+        g_zip: row.g_zip ?? null,
+        // Metadata (prompt expects these for context)
+        targetName: row.targetName ?? null,
+        publisherName: row.publisherName ?? null
     };
     return callData;
 };
@@ -342,14 +257,15 @@ const buildResponseFormat = () => {
     return { type: 'json_object' };
 };
 
-// Build system message with prompt caching support
-const buildSystemMessage = () => {
+// Build system message with prompt caching support.
+// systemPrompt is sourced from the campaign_prompts DB table at runtime.
+const buildSystemMessage = (systemPrompt) => {
     return {
         role: 'system',
         content: [
             {
                 type: 'text',
-                text: SYSTEM_PROMPT,
+                text: systemPrompt,
                 cache_control: { type: 'ephemeral' }
             }
         ]
@@ -357,11 +273,11 @@ const buildSystemMessage = () => {
 };
 
 // Make API request to OpenRouter
-const makeOpenRouterRequest = async (userPrompt) => {
+const makeOpenRouterRequest = async (userPrompt, systemPrompt) => {
     const requestBody = {
         model: config.model,
         messages: [
-            buildSystemMessage(),
+            buildSystemMessage(systemPrompt),
             { role: 'user', content: userPrompt }
         ],
         temperature: config.temperature,
@@ -385,7 +301,7 @@ const makeOpenRouterRequest = async (userPrompt) => {
         // If json_schema not supported, retry with json_object fallback
         if (config.useSchema && response.status === 400 && error.includes('json_schema')) {
             console.warn('Model does not support json_schema, falling back to json_object mode');
-            return makeOpenRouterRequestFallback(userPrompt);
+            return makeOpenRouterRequestFallback(userPrompt, systemPrompt);
         }
         throw new Error(`OpenRouter API error: ${response.status} - ${error}`);
     }
@@ -401,11 +317,11 @@ const makeOpenRouterRequest = async (userPrompt) => {
 };
 
 // Fallback request using json_object mode (for models that don't support json_schema)
-const makeOpenRouterRequestFallback = async (userPrompt) => {
+const makeOpenRouterRequestFallback = async (userPrompt, systemPrompt) => {
     const requestBody = {
         model: config.model,
         messages: [
-            buildSystemMessage(),
+            buildSystemMessage(systemPrompt),
             { role: 'user', content: userPrompt }
         ],
         temperature: config.temperature,
@@ -479,7 +395,7 @@ export const validateAIResponse = (response) => {
     }
 
     // Auto-fix array tiers (needed for json_object fallback)
-    for (const tier of ['tier2', 'tier3', 'tier6', 'tier7', 'tier8', 'tier9']) {
+    for (const tier of ['tier2', 'tier3', 'tier6', 'tier7', 'tier8', 'tier9', 'tier10']) {
         if (!response[tier]) {
             response[tier] = { values: [], reasons: {} };
         } else if (!Array.isArray(response[tier].values)) {
@@ -515,10 +431,12 @@ export const validateAIResponse = (response) => {
     return response;
 };
 
-// Main analysis function - analyzes a single call
-export const analyzeCall = async (callData) => {
+// Main analysis function - analyzes a single call.
+// systemPrompt is loaded from campaign_prompts at runtime (passed by processor.js).
+export const analyzeCall = async (callData, systemPrompt) => {
+    if (!systemPrompt) throw new Error('analyzeCall: systemPrompt is required');
     const userPrompt = createUserPrompt(callData);
-    const makeRequest = () => makeOpenRouterRequest(userPrompt);
+    const makeRequest = () => makeOpenRouterRequest(userPrompt, systemPrompt);
 
     const result = await retryWithBackoff(
         makeRequest,
@@ -529,16 +447,17 @@ export const analyzeCall = async (callData) => {
     return validateAIResponse(result);
 };
 
-// Process a batch of calls
-export const processBatch = async (rows) => {
-    console.log(config, "Openrouter config")
+// Process a batch of calls — all rows in a batch share the same systemPrompt.
+// The processor groups by campaign and calls this once per unique prompt.
+export const processBatch = async (rows, systemPrompt) => {
+    if (!systemPrompt) throw new Error('processBatch: systemPrompt is required');
     const results = await Promise.allSettled(
         rows.map(async (row) => {
             const startTime = Date.now();
 
             try {
                 const callData = buildCallData(row);
-                const aiResponse = await analyzeCall(callData);
+                const aiResponse = await analyzeCall(callData, systemPrompt);
 
                 return {
                     success: true,

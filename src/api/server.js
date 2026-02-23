@@ -163,8 +163,8 @@ const routes = {
                     td.tag_name,
                     td.priority,
                     td.importance,
-                    COUNT(ct.id) as usage_count,
-                    AVG(ct.confidence) as avg_confidence
+                    COUNT(ct.call_id) AS usage_count,
+                    AVG(ct.confidence) AS avg_confidence
                 FROM tag_definitions td
                 LEFT JOIN call_tags ct ON td.id = ct.tag_id
                 GROUP BY td.id, td.tag_name, td.priority, td.importance
@@ -181,6 +181,110 @@ const routes = {
             sendJson(res, 200, stats);
         } catch (error) {
             logger.error('Tag stats API error:', error);
+            sendJson(res, 500, { error: error.message });
+        }
+    },
+
+    // ── Campaign Prompts ───────────────────────────────────────────────────────
+
+    // List all prompts (metadata only; no body text).
+    // Optional query param: ?campaign_id=CAxxx
+    'GET /api/prompts': async (req, res) => {
+        try {
+            const parsedUrl = url.parse(req.url, true);
+            const { campaign_id } = parsedUrl.query;
+            const filter = campaign_id === undefined ? undefined : campaign_id;
+
+            const prompts = await db.listPrompts(filter);
+            sendJson(res, 200, { prompts, count: prompts.length });
+        } catch (error) {
+            logger.error('List prompts API error:', error);
+            sendJson(res, 500, { error: error.message });
+        }
+    },
+
+    // Get a single prompt by numeric id — returns full system_prompt text.
+    'GET /api/prompts/:id': async (req, res, id) => {
+        try {
+            const prompt = await db.getPromptById(id);
+            if (!prompt) return sendJson(res, 404, { error: 'Prompt not found' });
+            sendJson(res, 200, prompt);
+        } catch (error) {
+            logger.error('Get prompt API error:', error);
+            sendJson(res, 500, { error: error.message });
+        }
+    },
+
+    // Create a new prompt version.
+    // Automatically deactivates the currently-active prompt for the same campaign.
+    //
+    // Body:
+    //   system_prompt   string  REQUIRED — full prompt text
+    //   campaign_id     string  REQUIRED — no global default
+    //   campaign_name   string  optional
+    //   prompt_version  string  optional — default "V5"
+    //   notes           string  optional
+    'POST /api/prompts': async (req, res) => {
+        try {
+            const body = await parseBody(req);
+
+            if (!body.system_prompt || body.system_prompt.trim() === '') {
+                return sendJson(res, 400, { error: 'Missing required field: system_prompt' });
+            }
+            if (!body.campaign_id || String(body.campaign_id).trim() === '') {
+                return sendJson(res, 400, { error: 'Missing required field: campaign_id (no global prompt)' });
+            }
+
+            const campaignId = String(body.campaign_id).trim();
+
+            const created = await db.createPromptVersion(
+                campaignId,
+                body.campaign_name ?? null,
+                body.prompt_version ?? 'V5',
+                body.system_prompt.trim(),
+                body.notes ?? null
+            );
+
+            sendJson(res, 201, { message: 'Prompt version created', prompt: created });
+        } catch (error) {
+            logger.error('Create prompt API error:', error);
+            sendJson(res, 500, { error: error.message });
+        }
+    },
+
+    // Update prompt metadata (campaign_name, notes, prompt_version).
+    // To change the actual system_prompt text, use POST /api/prompts (new version).
+    //
+    // Body (all optional):
+    //   campaign_name   string
+    //   prompt_version  string
+    //   notes           string
+    'PUT /api/prompts/:id': async (req, res, id) => {
+        try {
+            const body = await parseBody(req);
+
+            const updated = await db.updatePromptMeta(id, {
+                campaign_name: body.campaign_name,
+                notes:         body.notes,
+                prompt_version: body.prompt_version
+            });
+
+            if (!updated) return sendJson(res, 404, { error: 'Prompt not found' });
+            sendJson(res, 200, { message: 'Prompt metadata updated', prompt: updated });
+        } catch (error) {
+            logger.error('Update prompt API error:', error);
+            sendJson(res, 500, { error: error.message });
+        }
+    },
+
+    // Deactivate a prompt (soft delete — keeps historical record).
+    'DELETE /api/prompts/:id': async (req, res, id) => {
+        try {
+            const result = await db.deactivatePrompt(id);
+            if (!result) return sendJson(res, 404, { error: 'Prompt not found' });
+            sendJson(res, 200, { message: 'Prompt deactivated', prompt: result });
+        } catch (error) {
+            logger.error('Deactivate prompt API error:', error);
             sendJson(res, 500, { error: error.message });
         }
     }
@@ -216,11 +320,19 @@ const handleRequest = async (req, res) => {
     }
     
     // Check for parameterized routes
+
     if (method === 'GET' && pathname.startsWith('/api/calls/')) {
         const callId = pathname.split('/')[3];
         return await routes['GET /api/calls/:callId'](req, res, callId);
     }
-    
+
+    if (pathname.startsWith('/api/prompts/')) {
+        const id = pathname.split('/')[3];
+        if (method === 'GET')    return await routes['GET /api/prompts/:id'](req, res, id);
+        if (method === 'PUT')    return await routes['PUT /api/prompts/:id'](req, res, id);
+        if (method === 'DELETE') return await routes['DELETE /api/prompts/:id'](req, res, id);
+    }
+
     // 404 for unmatched routes
     sendJson(res, 404, { error: 'Route not found' });
 };
@@ -245,6 +357,12 @@ export default {
                     logger.info('  GET  /api/calls/:callId - Get call analysis by ID');
                     logger.info('  POST /api/transcriptions/bulk - Bulk insert transcriptions');
                     logger.info('  GET  /api/tags/stats - Get tag usage statistics');
+                    logger.info('  GET  /api/prompts - List all prompts (metadata)');
+                    logger.info('  GET  /api/prompts?campaign_id=X - Filter by campaign');
+                    logger.info('  GET  /api/prompts/:id - Get prompt with full text');
+                    logger.info('  POST /api/prompts - Create new prompt version');
+                    logger.info('  PUT  /api/prompts/:id - Update prompt metadata');
+                    logger.info('  DELETE /api/prompts/:id - Deactivate a prompt');
                     resolve();
                 }
             });
