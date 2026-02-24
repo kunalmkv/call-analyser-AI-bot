@@ -1,6 +1,6 @@
-import db from './src/database/connection.js';
-import { runProcessingJob, startProcessingLoop } from './src/services/processor.js';
-import logger from './src/utils/logger.js';
+import db from '../src/database/connection.js';
+import { runProcessingJob, startProcessingLoop } from '../src/services/processor.js';
+import logger from '../src/utils/logger.js';
 
 const cleanupAndRun = async () => {
     try {

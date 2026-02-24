@@ -76,20 +76,22 @@ export const getBillingDiscrepancies = async (limit = 50) => {
 export const getUnbilledButBillable = async (limit = 100) => {
     const result = await db.query(
         `SELECT
-            ringba_row_id,
-            ringba_caller_id,
-            tier1_data->>'value'  AS tier1_value,
-            tier5_data->>'value'  AS tier5_value,
-            tier5_data->>'reason' AS tier5_reason,
-            current_revenue,
-            current_billed_status,
-            call_summary,
-            processed_at
-         FROM call_analysis_v2
-         WHERE tier5_data->>'value' IN ('LIKELY_BILLABLE', 'DEFINITELY_BILLABLE')
-           AND current_billed_status = false
-           AND current_revenue = 0
-         ORDER BY processed_at DESC
+            v2.ringba_row_id,
+            v2.ringba_caller_id,
+            td1.tag_value AS tier1_value,
+            td5.tag_value AS tier5_value,
+            v2.tier5_data->'reasons'->>(v2.tier5_data->'value_ids'->>0) AS tier5_reason,
+            v2.current_revenue,
+            v2.current_billed_status,
+            v2.call_summary,
+            v2.processed_at
+         FROM call_analysis_v2 v2
+         LEFT JOIN tag_definitions td1 ON td1.id = (v2.tier1_data->'value_ids'->>0)::int
+         LEFT JOIN tag_definitions td5 ON td5.id = (v2.tier5_data->'value_ids'->>0)::int
+         WHERE td5.tag_value IN ('LIKELY_BILLABLE', 'DEFINITELY_BILLABLE')
+           AND v2.current_billed_status = false
+           AND v2.current_revenue = 0
+         ORDER BY v2.processed_at DESC
          LIMIT $1`,
         [limit]
     );
@@ -102,20 +104,22 @@ export const getUnbilledButBillable = async (limit = 100) => {
 export const getBilledButNotBillable = async (limit = 100) => {
     const result = await db.query(
         `SELECT
-            ringba_row_id,
-            ringba_caller_id,
-            tier1_data->>'value'  AS tier1_value,
-            tier5_data->>'value'  AS tier5_value,
-            tier5_data->>'reason' AS tier5_reason,
-            current_revenue,
-            current_billed_status,
-            call_summary,
-            processed_at
-         FROM call_analysis_v2
-         WHERE tier5_data->>'value' = 'DEFINITELY_NOT_BILLABLE'
-           AND current_billed_status = true
-           AND current_revenue > 0
-         ORDER BY current_revenue DESC, processed_at DESC
+            v2.ringba_row_id,
+            v2.ringba_caller_id,
+            td1.tag_value AS tier1_value,
+            td5.tag_value AS tier5_value,
+            v2.tier5_data->'reasons'->>(v2.tier5_data->'value_ids'->>0) AS tier5_reason,
+            v2.current_revenue,
+            v2.current_billed_status,
+            v2.call_summary,
+            v2.processed_at
+         FROM call_analysis_v2 v2
+         LEFT JOIN tag_definitions td1 ON td1.id = (v2.tier1_data->'value_ids'->>0)::int
+         LEFT JOIN tag_definitions td5 ON td5.id = (v2.tier5_data->'value_ids'->>0)::int
+         WHERE td5.tag_value = 'DEFINITELY_NOT_BILLABLE'
+           AND v2.current_billed_status = true
+           AND v2.current_revenue > 0
+         ORDER BY v2.current_revenue DESC, v2.processed_at DESC
          LIMIT $1`,
         [limit]
     );
@@ -195,16 +199,18 @@ export const searchCallSummaries = async (searchTerm, limit = 50) => {
 export const getCallsByConfidence = async (minConfidence = 0, maxConfidence = 1, limit = 100) => {
     const result = await db.query(
         `SELECT
-            ringba_row_id,
-            ringba_caller_id,
-            tier1_data->>'value' AS tier1_value,
-            tier5_data->>'value' AS tier5_value,
-            confidence_score,
-            call_summary,
-            processed_at
-         FROM call_analysis_v2
-         WHERE confidence_score BETWEEN $1 AND $2
-         ORDER BY confidence_score ASC, processed_at DESC
+            v2.ringba_row_id,
+            v2.ringba_caller_id,
+            td1.tag_value AS tier1_value,
+            td5.tag_value AS tier5_value,
+            v2.confidence_score,
+            v2.call_summary,
+            v2.processed_at
+         FROM call_analysis_v2 v2
+         LEFT JOIN tag_definitions td1 ON td1.id = (v2.tier1_data->'value_ids'->>0)::int
+         LEFT JOIN tag_definitions td5 ON td5.id = (v2.tier5_data->'value_ids'->>0)::int
+         WHERE v2.confidence_score BETWEEN $1 AND $2
+         ORDER BY v2.confidence_score ASC, v2.processed_at DESC
          LIMIT $3`,
         [minConfidence, maxConfidence, limit]
     );

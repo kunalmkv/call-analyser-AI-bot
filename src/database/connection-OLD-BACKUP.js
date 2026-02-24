@@ -1,15 +1,3 @@
-/**
- * UPDATED DATABASE CONNECTION WITH TAG ID SUPPORT
- *
- * This file contains the updated query functions that work with the new tag ID format.
- * After testing, replace connection.js with this file.
- *
- * Key changes:
- * - All tier queries JOIN with tag_definitions to get human-readable tag_values
- * - searchByTier works with tag_id filtering (requires tag_value → tag_id lookup)
- * - All views updated to include JOINs
- */
-
 import pg from 'pg';
 import { getDbConfig } from '../config/index.js';
 import { curry, pipe, map, prop } from 'ramda';
@@ -205,37 +193,23 @@ export const deactivatePrompt = (id) =>
         [id]
     );
 
-// ══════════════════════════════════════════════════════════════════════════════
-// V2 Database Operations for Tier-Based Queries (UPDATED FOR TAG IDS)
-// ══════════════════════════════════════════════════════════════════════════════
-
+// V2 Database Operations for Tier-Based Queries
 export const dbOperations = {
-    // Get analysis by ringba row ID (with human-readable tag values via JOINs)
-    getAnalysisByRowId: async (rowId) => {
-        const result = await queryOne(
-            `SELECT
-                v2.*,
-                td1.tag_value AS tier1_tag_value,
-                td4.tag_value AS tier4_tag_value,
-                td5.tag_value AS tier5_tag_value
-             FROM call_analysis_v2 v2
-             LEFT JOIN tag_definitions td1 ON td1.id = (v2.tier1_data->'value_ids'->>0)::int
-             LEFT JOIN tag_definitions td4 ON td4.id = (v2.tier4_data->'value_ids'->>0)::int
-             LEFT JOIN tag_definitions td5 ON td5.id = (v2.tier5_data->'value_ids'->>0)::int
-             WHERE v2.ringba_row_id = $1`,
+    // Get analysis by ringba row ID
+    getAnalysisByRowId: (rowId) =>
+        queryOne(
+            `SELECT * FROM call_analysis_v2 WHERE ringba_row_id = $1`,
             [rowId]
-        );
-        return result;
-    },
+        ),
 
-    /**
-     * Search by tier value (with tag ID conversion)
-     * @param {number} tierNumber - Tier number (1-10)
-     * @param {string} value - Tag value to search for (will be converted to tag_id)
-     * @param {number} limit - Max results
-     */
+    // Search by tier value (tierNumber must be 1–10 to prevent SQL injection).
+    //
+    // All tiers use only tierN_data JSONB — no separate _value columns.
+    // Single-value tiers (1,4,5): equality on tier${n}_data->>'value'  (functional index)
+    // Array tiers (2,3,6–10):     containment on tier${n}_data->'values' (GIN index)
     searchByTier: async (tierNumber, value, limit = 100) => {
         const VALID_TIERS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        const SINGLE_VALUE_TIERS = new Set([1, 4, 5]);
         const n = Number(tierNumber);
         if (!VALID_TIERS.includes(n)) {
             throw new Error(`Invalid tier number: ${tierNumber}. Must be 1–10.`);
@@ -243,147 +217,126 @@ export const dbOperations = {
 
         const dataCol = `tier${n}_data`;
 
-        // First, look up the tag_id for the given tag_value
-        const tagRow = await queryOne(
-            `SELECT id FROM tag_definitions WHERE tag_value = $1 LIMIT 1`,
-            [value]
-        );
-
-        if (!tagRow) {
-            // Tag value not found in definitions, return empty result
-            console.warn(`searchByTier: Unknown tag_value "${value}"`);
-            return [];
+        if (SINGLE_VALUE_TIERS.has(n)) {
+            return query(
+                `SELECT
+                    ringba_row_id,
+                    ringba_caller_id,
+                    tier1_data->>'value'  AS tier1_value,
+                    tier4_data->>'value'  AS tier4_value,
+                    tier5_data->>'value'  AS tier5_value,
+                    ${dataCol}->>'value'  AS tier_value,
+                    ${dataCol}->>'reason' AS tier_reason,
+                    call_summary,
+                    confidence_score,
+                    processed_at
+                 FROM call_analysis_v2
+                 WHERE ${dataCol}->>'value' = $1
+                 ORDER BY processed_at DESC
+                 LIMIT $2`,
+                [value, limit]
+            );
+        } else {
+            return query(
+                `SELECT
+                    ringba_row_id,
+                    ringba_caller_id,
+                    tier1_data->>'value'  AS tier1_value,
+                    tier4_data->>'value'  AS tier4_value,
+                    tier5_data->>'value'  AS tier5_value,
+                    ${dataCol}->'values'  AS tier_values,
+                    ${dataCol}->'reasons' AS tier_reasons,
+                    call_summary,
+                    confidence_score,
+                    processed_at
+                 FROM call_analysis_v2
+                 WHERE ${dataCol}->'values' @> $1::jsonb
+                 ORDER BY processed_at DESC
+                 LIMIT $2`,
+                [JSON.stringify([value]), limit]
+            );
         }
-
-        const tagId = tagRow.id;
-
-        // Query using tag_id in the value_ids array
-        return query(
-            `SELECT
-                v2.ringba_row_id,
-                v2.ringba_caller_id,
-                td1.tag_value AS tier1_value,
-                td4.tag_value AS tier4_value,
-                td5.tag_value AS tier5_value,
-                v2.${dataCol},
-                v2.call_summary,
-                v2.confidence_score,
-                v2.processed_at
-             FROM call_analysis_v2 v2
-             LEFT JOIN tag_definitions td1 ON td1.id = (v2.tier1_data->'value_ids'->>0)::int
-             LEFT JOIN tag_definitions td4 ON td4.id = (v2.tier4_data->'value_ids'->>0)::int
-             LEFT JOIN tag_definitions td5 ON td5.id = (v2.tier5_data->'value_ids'->>0)::int
-             WHERE v2.${dataCol}->'value_ids' @> $1::jsonb
-             ORDER BY v2.processed_at DESC
-             LIMIT $2`,
-            [JSON.stringify([tagId]), limit]
-        );
     },
 
-    // Get dispute candidates (uses view, which now has JOINs)
+    // Get dispute candidates
     getDisputeCandidates: (limit = 50) =>
         query(
             `SELECT * FROM v_dispute_candidates LIMIT $1`,
             [limit]
         ),
 
-    // Get billing discrepancies (uses view, which now has JOINs)
+    // Get billing discrepancies
     getBillingDiscrepancies: (limit = 50) =>
         query(
             `SELECT * FROM v_billing_discrepancies LIMIT $1`,
             [limit]
         ),
 
-    // Search call summaries with full-text search
-    searchCallSummaries: async (searchTerm, limit = 50) =>
+    // Search call summaries with full-text search (COALESCE matches the GIN index expression)
+    searchCallSummaries: (searchTerm, limit = 50) =>
         query(
             `SELECT
-                v2.ringba_row_id,
-                v2.ringba_caller_id,
-                td1.tag_value AS tier1_value,
-                td5.tag_value AS tier5_value,
-                v2.call_summary,
-                ts_rank(to_tsvector('english', COALESCE(v2.call_summary, '')), plainto_tsquery('english', $1)) AS rank
-             FROM call_analysis_v2 v2
-             LEFT JOIN tag_definitions td1 ON td1.id = (v2.tier1_data->'value_ids'->>0)::int
-             LEFT JOIN tag_definitions td5 ON td5.id = (v2.tier5_data->'value_ids'->>0)::int
-             WHERE to_tsvector('english', COALESCE(v2.call_summary, '')) @@ plainto_tsquery('english', $1)
-             ORDER BY rank DESC, v2.processed_at DESC
+                ringba_row_id,
+                ringba_caller_id,
+                tier1_data->>'value' AS tier1_value,
+                tier5_data->>'value' AS tier5_value,
+                call_summary,
+                ts_rank(to_tsvector('english', COALESCE(call_summary, '')), plainto_tsquery('english', $1)) AS rank
+             FROM call_analysis_v2
+             WHERE to_tsvector('english', COALESCE(call_summary, '')) @@ plainto_tsquery('english', $1)
+             ORDER BY rank DESC, processed_at DESC
              LIMIT $2`,
             [searchTerm, limit]
         ),
 
-    // Query by tier2 quality flags (using tag_value → tag_id conversion)
-    getQualityFlagCalls: async (flag, limit = 100) => {
-        const tagRow = await queryOne(
-            `SELECT id FROM tag_definitions WHERE tag_value = $1 LIMIT 1`,
-            [flag]
-        );
-        if (!tagRow) return [];
-
-        return query(
+    // Query by tier2 quality flags (JSONB containment, GIN indexed)
+    getQualityFlagCalls: (flag, limit = 100) =>
+        query(
             `SELECT
-                v2.ringba_row_id,
-                v2.ringba_caller_id,
-                td1.tag_value AS tier1_value,
-                v2.tier2_data,
-                v2.call_summary,
-                v2.processed_at
-             FROM call_analysis_v2 v2
-             LEFT JOIN tag_definitions td1 ON td1.id = (v2.tier1_data->'value_ids'->>0)::int
-             WHERE v2.tier2_data->'value_ids' @> $1::jsonb
-             ORDER BY v2.processed_at DESC
+                ringba_row_id,
+                ringba_caller_id,
+                tier1_data->>'value' AS tier1_value,
+                tier2_data,
+                call_summary,
+                processed_at
+             FROM call_analysis_v2
+             WHERE tier2_data->'values' @> $1::jsonb
+             ORDER BY processed_at DESC
              LIMIT $2`,
-            [JSON.stringify([tagRow.id]), limit]
-        );
-    },
+            [JSON.stringify([flag]), limit]
+        ),
 
-    // Query by tier3 customer intent (using tag_value → tag_id conversion)
-    getIntentCalls: async (intent, limit = 100) => {
-        const tagRow = await queryOne(
-            `SELECT id FROM tag_definitions WHERE tag_value = $1 LIMIT 1`,
-            [intent]
-        );
-        if (!tagRow) return [];
-
-        return query(
+    // Query by tier3 customer intent (JSONB containment, GIN indexed)
+    getIntentCalls: (intent, limit = 100) =>
+        query(
             `SELECT
-                v2.ringba_row_id,
-                v2.ringba_caller_id,
-                td1.tag_value AS tier1_value,
-                v2.tier3_data,
-                td4.tag_value AS tier4_value,
-                v2.call_summary,
-                v2.processed_at
-             FROM call_analysis_v2 v2
-             LEFT JOIN tag_definitions td1 ON td1.id = (v2.tier1_data->'value_ids'->>0)::int
-             LEFT JOIN tag_definitions td4 ON td4.id = (v2.tier4_data->'value_ids'->>0)::int
-             WHERE v2.tier3_data->'value_ids' @> $1::jsonb
-             ORDER BY v2.processed_at DESC
+                ringba_row_id,
+                ringba_caller_id,
+                tier1_data->>'value' AS tier1_value,
+                tier3_data,
+                tier4_data->>'value' AS tier4_value,
+                call_summary,
+                processed_at
+             FROM call_analysis_v2
+             WHERE tier3_data->'values' @> $1::jsonb
+             ORDER BY processed_at DESC
              LIMIT $2`,
-            [JSON.stringify([tagRow.id]), limit]
-        );
-    },
+            [JSON.stringify([intent]), limit]
+        ),
 
     // Get analytics report data — single MATERIALIZED CTE scan instead of 5 independent scans
     getAnalyticsData: (startDate, endDate) =>
         queryOne(
             `WITH base AS MATERIALIZED (
                 SELECT
-                    v2.tier1_data->'value_ids'->>0 AS tier1_id,
-                    v2.tier4_data->'value_ids'->>0 AS tier4_id,
-                    v2.tier5_data->'value_ids'->>0 AS tier5_id,
-                    td1.tag_value AS tier1,
-                    td4.tag_value AS tier4,
-                    td5.tag_value AS tier5,
-                    v2.dispute_recommendation,
-                    v2.confidence_score,
-                    v2.current_revenue
-                FROM call_analysis_v2 v2
-                LEFT JOIN tag_definitions td1 ON td1.id = v2.tier1_data->'value_ids'->>0::int
-                LEFT JOIN tag_definitions td4 ON td4.id = v2.tier4_data->'value_ids'->>0::int
-                LEFT JOIN tag_definitions td5 ON td5.id = v2.tier5_data->'value_ids'->>0::int
-                WHERE v2.processed_at BETWEEN $1 AND $2
+                    tier1_data->>'value' AS tier1,
+                    tier4_data->>'value' AS tier4,
+                    tier5_data->>'value' AS tier5,
+                    dispute_recommendation,
+                    confidence_score,
+                    current_revenue
+                FROM call_analysis_v2
+                WHERE processed_at BETWEEN $1 AND $2
              )
              SELECT json_build_object(
                 'period',           json_build_object('start', $1, 'end', $2),

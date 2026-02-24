@@ -59,10 +59,12 @@ const saveCallTagsFromV2Response = async (client, rowId, aiResponse, valueToTagI
     for (const { tagId } of rows) {
         params.push(tagId, confidence);
     }
+
+    // Use ON CONFLICT on constraint name instead
     await client.query(
         `INSERT INTO call_tags (call_id, tag_id, confidence)
          VALUES ${valuePlaceholders}
-         ON CONFLICT (call_id, tag_id) DO UPDATE
+         ON CONFLICT ON CONSTRAINT call_tags_pkey DO UPDATE
          SET confidence = EXCLUDED.confidence`,
         params
     );
@@ -70,21 +72,73 @@ const saveCallTagsFromV2Response = async (client, rowId, aiResponse, valueToTagI
 
 // Save a single V5 tiered result to call_analysis_v2 (main) + call_analysis_v2_raw (debug blob).
 //
-// ALL tiers use only tierN_data JSONB — no separate _value columns anywhere:
-//   • Single-value tiers (1, 4, 5): {"value":"…", "reason":"…"}
-//   • Array tiers (2, 3, 6–10):     {"values":[…], "reasons":{…}}
-const saveV2Result = async (client, result, callTimestamp = null) => {
+// NEW FORMAT - ALL tiers use uniform array structure with tag IDs:
+//   • ALL tiers: {"value_ids":[1,2,3], "reasons":{"1":"…","2":"…","3":"…"}}
+//
+// The AI response comes with tag_values (strings), so we convert to tag_ids before saving.
+const saveV2Result = async (client, result, callTimestamp = null, valueToTagId) => {
     const { rowId, aiResponse, processingTimeMs, modelUsed } = result;
     const r = aiResponse;
 
-    // Build JSONB for single-value tiers: {"value":"…","reason":"…"}
-    const svData = (tier) => JSON.stringify({
-        value:  tier?.value  ?? null,
-        reason: tier?.reason ?? null,
-    });
+    if (!valueToTagId || valueToTagId.size === 0) {
+        throw new Error('saveV2Result: valueToTagId map is required for tag ID conversion');
+    }
 
-    // Build JSONB for array tiers: {"values":[…],"reasons":{…}}
-    const arrData = (tier) => JSON.stringify(tier || { values: [], reasons: {} });
+    /**
+     * Convert AI response tier (with string tag_values) to database format (with integer tag_ids)
+     * @param {Object} tier - AI response tier data
+     * @param {Boolean} isSingleValue - True for tiers 1, 4, 5 (convert value → [value_id])
+     * @returns {String} JSON string for database storage
+     */
+    const convertTierToTagIds = (tier, isSingleValue = false) => {
+        if (!tier) {
+            return JSON.stringify({ value_ids: [], reasons: {} });
+        }
+
+        const value_ids = [];
+        const reasons = {};
+
+        if (isSingleValue) {
+            // Single-value tier: {"value": "TAG_VALUE", "reason": "..."}
+            // Convert to: {"value_ids": [42], "reasons": {"42": "..."}}
+            const tagValue = tier.value;
+            const tagReason = tier.reason;
+
+            if (tagValue && tagValue !== 'UNKNOWN') {
+                const tagId = valueToTagId.get(tagValue);
+                if (tagId !== undefined) {
+                    value_ids.push(tagId);
+                    if (tagReason) {
+                        reasons[tagId.toString()] = tagReason;
+                    }
+                } else {
+                    logger.warn(`Unknown tag_value: "${tagValue}" - skipping`);
+                }
+            }
+        } else {
+            // Array tier: {"values": ["TAG1", "TAG2"], "reasons": {"TAG1": "...", "TAG2": "..."}}
+            // Convert to: {"value_ids": [1, 2], "reasons": {"1": "...", "2": "..."}}
+            const tagValues = tier.values || [];
+            const tagReasons = tier.reasons || {};
+
+            for (const tagValue of tagValues) {
+                if (tagValue && typeof tagValue === 'string') {
+                    const tagId = valueToTagId.get(tagValue);
+                    if (tagId !== undefined) {
+                        value_ids.push(tagId);
+                        const reason = tagReasons[tagValue];
+                        if (reason) {
+                            reasons[tagId.toString()] = reason;
+                        }
+                    } else {
+                        logger.warn(`Unknown tag_value: "${tagValue}" - skipping`);
+                    }
+                }
+            }
+        }
+
+        return JSON.stringify({ value_ids, reasons });
+    };
 
     await client.query(
         `INSERT INTO call_analysis_v2 (
@@ -144,16 +198,16 @@ const saveV2Result = async (client, result, callTimestamp = null) => {
             rowId,                                   // $1
             r.ringbaCallerId || null,                // $2
             callTimestamp,                           // $3
-            svData(r.tier1),                         // $4  {"value":"…","reason":"…"}
-            arrData(r.tier2),                        // $5  {"values":[…],"reasons":{…}}
-            arrData(r.tier3),                        // $6
-            svData(r.tier4),                         // $7
-            svData(r.tier5),                         // $8
-            arrData(r.tier6),                        // $9
-            arrData(r.tier7),                        // $10
-            arrData(r.tier8),                        // $11
-            arrData(r.tier9),                        // $12
-            arrData(r.tier10),                       // $13
+            convertTierToTagIds(r.tier1, true),      // $4  {"value_ids":[42],"reasons":{"42":"…"}}
+            convertTierToTagIds(r.tier2, false),     // $5  {"value_ids":[1,2],"reasons":{"1":"…","2":"…"}}
+            convertTierToTagIds(r.tier3, false),     // $6
+            convertTierToTagIds(r.tier4, true),      // $7
+            convertTierToTagIds(r.tier5, true),      // $8
+            convertTierToTagIds(r.tier6, false),     // $9
+            convertTierToTagIds(r.tier7, false),     // $10
+            convertTierToTagIds(r.tier8, false),     // $11
+            convertTierToTagIds(r.tier9, false),     // $12
+            convertTierToTagIds(r.tier10, false),    // $13
             r.confidence_score || 0.5,               // $14
             r.dispute_recommendation || 'NONE',      // $15
             r.dispute_recommendation_reason || null, // $16
@@ -319,8 +373,8 @@ const processSequentialBatches = async (batchSize, totalLimit) => {
                     const row = rows.find((r) => r.id === result.rowId);
                     const callTimestamp = row?.call_date ?? null;
                     await db.withTransaction(async (client) => {
-                        // Save V5 tiered analysis (include call timestamp from source row)
-                        await saveV2Result(client, result, callTimestamp);
+                        // Save V5 tiered analysis (include call timestamp from source row, convert tag_values to tag_ids)
+                        await saveV2Result(client, result, callTimestamp, valueToTagId);
 
                         // Save call_tags from tier values (tag_value -> tag_id)
                         await saveCallTagsFromV2Response(
@@ -345,7 +399,11 @@ const processSequentialBatches = async (batchSize, totalLimit) => {
                         savedInBatch++;
                     });
                 } catch (error) {
-                    logger.error(`Failed to save row ${result.rowId} in batch ${batchNumber}:`, error.message);
+                    logger.error(`Failed to save row ${result.rowId} in batch ${batchNumber}:`);
+                    logger.error(`  Error: ${error.message}`);
+                    logger.error(`  Code: ${error.code}`);
+                    if (error.detail) logger.error(`  Detail: ${error.detail}`);
+                    console.error('Full error:', error);
                 }
             }
 
