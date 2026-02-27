@@ -1,5 +1,6 @@
 import { processBatch } from './src/services/openRouterClient.js';
 import logger from './src/utils/logger.js';
+import db from './src/database/connection.js';
 
 // ============================================================
 // MANUAL CALL TEST SCRIPT
@@ -15,32 +16,10 @@ const TEST_CALL = {
     ringba_caller_id: '+15551234567',
 
     // PASTE YOUR TRANSCRIPT HERE (A/B format will be auto-converted to Agent/Customer)
-    transcript: `00:01 A - Please enter the zip code where you need appliance repair. Please hold to be connected.,
-00:27 B - Thank you for calling Steers Home Services. To schedule your service. I am going to transfer your call to Samantha, our AI repair agent to ensure quality service. This call may be monitored or recorded by us or our vendors and by continuing you agree to our privacy policy and terms@searshomeservices.com let's get your service. I am connecting you now.,
-00:59 A - Hi, I am Samantha, an AI virtual voice agent for Sears Home Services. How can I assist you today?,
-01:09 B - I thought I was calling LG Customer Service.,
-01:15 A - You have reached Sears Home Services. We do service LG Appliances. If you need repair or maintenance for your LG appliance, I can help schedule a technician visit. What type of LG appliance do you need help with and what issue are you experiencing?,
-01:30 B - I got a recall on my stove I double oven stove and we had Home Depot put it in and they didn't put this tag where supposed to be where the model number the serial number was and they can't find nothing for that unit and that's the reason why I'm calling that. The model number is LDEL7324SE.,
-02:11 A - Thank you for sharing the model number and the details about your double oven. Could you please describe the issue you are experiencing with your LG double oven?,
-02:21 B - There has been a recall on the button on the stove.,
-02:32 A - Thank you for letting me know about the recall on the button for your LG double oven. Since this is related to a recall, I want to make sure we handle it correctly. Have you already had a technician from Sears Home Services work on this oven for the recall or is this your first time reaching out for service on this issue?,
-02:49 B - First time.,
-03:01 A - Thank you for clarifying. I can help schedule a technician to inspect and address the recall issue on your LG double oven. Could you please provide the brand of your double oven? Just to confirm you mentioned lg but I want to be sure before proceeding.,
-03:15 B - Yes, it's a LG. Model number is LDEL7324SE.,
-03:31 A - Thank you for confirming the brand and model number. To move forward, I will need the address where the oven is located. Could you please provide the full street address? City and State.,
-03:41 B - 51 Walker Court, Charles Tanner, West Virginia 2541.,
-03:52 A - Thank you. Could you please. Thank you. Just give me a moment. The earliest available slot for a technician Visit is Monday, February 16, 7am to 6pm Would you like to reserve this slot?,
-04:18 B - What are they going to be? Can you just tell me a little bit about the recall thing. Are they going to repair it or just come and look at it?,
-04:37 A - For a recall issue, the technician will first inspect your LG double oven to confirm the recall concern. If the recall applies and the required parts or repairs are covered, they will perform the necessary repair during the visit or arrange for parts if needed. If it is not covered by the recall, the technician will explain the next steps and any costs before proceeding. Would you like to reserve the earliest available slot on Monday, February 16th between 7am and 6pm?,
-05:08 B - Can you do. No, I can't. I can't do Monday.,
-05:18 A - Understood. Here are two other available Monday, February 16 8am to 5pm Tuesday, February 17 7am to 6pm Would either of these work for you? If not, please let me know your preferred date and time within our appointment windows of 8am to 5pm.,
-05:40 B - Can you do Thursday the 19th?,
-05:55 A - I can offer you Thursday, February 19th with two available time windows. 7am to 6pm 8am to 5pm which time window would you prefer?,
-06:07 B - 7Am.,
-06:15 A - Just to confirm, you would like to reserve Thursday, February 19th from 7am to 6pm for your LG double oven recall visit. The diagnostic fee is $129. It covers the technician's visit and diagnosis. If you go ahead with the repair, the fee goes toward the total cost. Otherwise, it is just the diagnostic fee. Do you agree to this?,
-06:36 B - How much is it?,
-06:43 A - The diagnostic fee is $129. This covers the technician's visit and diagnosis. If you proceed with the repair, this fee will be applied toward the total cost. Otherwise, it is just the diagnostic fee. Would you like to proceed with this appointment now?,
-06:59 B - I'm gonna. I'm. I'm gonna call lg. That's why I'm trying to get a hold of LG personally because they. Home Depot told me to call them direct to get. Tell them that you need a technician to come out. So if I need you all back. Okay, thank you.,
+    transcript: `00:00 A - This call may be recorded for quality assurance purposes. Please hold to be connected.,
+00:13 B - Prayer for Spiritual Healing,
+00:16 A - hello. Oh, here on the,
+00:18 B - Our first prayer is Sometimes we awaken in tremendous consolation. Our hearts are so lifted up with joy and we look and we desire God's love. He places it there. Grace without previous cause. We're just enlightened and want to be sanctified. We want to grow in His. It's his inspiration where he has come and set our hearts on fire with his own. I am going to reveal to you the secret of sanctity and happiness.,
 `,
 
     // Call metadata
@@ -134,19 +113,29 @@ async function testManualCall() {
     console.log('MANUAL CALL TAGGING TEST');
     console.log('='.repeat(70));
 
-    // Choose which test case to use (change this to test different scenarios)
-    const callToTest = TEST_CALL; // Change to SHORT_WRONG_NUMBER or SOFT_LEAD to test those
-
-    console.log('\nTest Call Details:');
-    console.log(`  ID: ${callToTest.id}`);
-    console.log(`  Caller: ${callToTest.caller_phone}`);
-    console.log(`  Duration: ${callToTest.duration}s`);
-    console.log(`  Revenue: $${callToTest.revenue}`);
-    console.log(`  Billed: ${callToTest.billed}`);
-    console.log(`  Transcript Length: ${callToTest.transcript.length} characters`);
-    console.log('\n' + '-'.repeat(70));
-
     try {
+        await db.initDatabase();
+
+        console.log('Fetching active system prompt from database...');
+        const prompts = await db.getActivePrompts();
+        if (!prompts || prompts.length === 0) {
+            throw new Error('No active campaign prompts found in the database. Please add one first.');
+        }
+        const systemPrompt = prompts[0].system_prompt;
+        console.log(`Using prompt version for campaign: ${prompts[0].campaign_name || prompts[0].campaign_id || 'Global'}`);
+
+        // Choose which test case to use (change this to test different scenarios)
+        const callToTest = TEST_CALL; // Change to SHORT_WRONG_NUMBER or SOFT_LEAD to test those
+
+        console.log('\nTest Call Details:');
+        console.log(`  ID: ${callToTest.id}`);
+        console.log(`  Caller: ${callToTest.caller_phone}`);
+        console.log(`  Duration: ${callToTest.duration}s`);
+        console.log(`  Revenue: $${callToTest.revenue}`);
+        console.log(`  Billed: ${callToTest.billed}`);
+        console.log(`  Transcript Length: ${callToTest.transcript.length} characters`);
+        console.log('\n' + '-'.repeat(70));
+
         // Add transcription field (auto-convert A/B to Agent/Customer)
         const processedCall = {
             ...callToTest,
@@ -158,7 +147,7 @@ async function testManualCall() {
         console.log('\nSending to AI for 10-tier tagging...\n');
 
         const startTime = Date.now();
-        const { successful, failed } = await processBatch([processedCall]);
+        const { successful, failed } = await processBatch([processedCall], systemPrompt);
         const processingTime = Date.now() - startTime;
 
         console.log('\n' + '='.repeat(70));
@@ -171,6 +160,8 @@ async function testManualCall() {
         if (successful.length > 0) {
             const result = successful[0];
             const ai = result.aiResponse;
+
+            console.log(`Model Used: ${result.modelUsed || 'Unknown'}`);
 
             console.log('\n' + '-'.repeat(70));
             console.log('AI TAGGING RESULTS');
@@ -315,11 +306,13 @@ async function testManualCall() {
     console.log('TEST COMPLETE');
     console.log('='.repeat(70) + '\n');
 
+    await db.closeDatabase();
     process.exit(0);
 }
 
 // Run the test
-testManualCall().catch(error => {
+testManualCall().catch(async error => {
     console.error('Fatal error:', error);
+    await db.closeDatabase().catch(() => { });
     process.exit(1);
 });

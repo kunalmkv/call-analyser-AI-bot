@@ -366,6 +366,16 @@ const processSequentialBatches = async (batchSize, totalLimit) => {
 
             logger.info(`Batch ${batchNumber} AI complete: ${successful.length} successful, ${failed.length} failed`);
 
+            // Log skipped calls but DON'T mark as processed
+            // This allows them to be retried if transcript becomes available later
+            const skippedCalls = failed.filter(f => f.skipped === true);
+            if (skippedCalls.length > 0) {
+                logger.info(`Skipped ${skippedCalls.length} calls with invalid transcripts (will retry in future runs if transcript becomes available)`);
+                for (const skipped of skippedCalls) {
+                    logger.info(`  Skipped row ${skipped.rowId}: ${skipped.error}`);
+                }
+            }
+
             // Save results one at a time
             let savedInBatch = 0;
             for (const result of successful) {
@@ -408,7 +418,9 @@ const processSequentialBatches = async (batchSize, totalLimit) => {
             }
 
             totalProcessed += savedInBatch;
-            logger.info(`Batch ${batchNumber} done: ${savedInBatch} saved, ${failed.length} failed`);
+            const actualFailures = failed.filter(f => f.skipped !== true).length;
+            const skippedCount = failed.filter(f => f.skipped === true).length;
+            logger.info(`Batch ${batchNumber} done: ${savedInBatch} saved, ${skippedCount} skipped (no transcript), ${actualFailures} failed`);
             logger.info(`Progress: ${totalProcessed}/${totalLimit}`);
 
             if (totalProcessed >= totalLimit) {

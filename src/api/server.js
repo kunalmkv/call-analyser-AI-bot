@@ -95,6 +95,25 @@ const routes = {
         }
     },
     
+    // Search call summaries by keyword (full-text search; uses idx_v2_summary_fts)
+    'GET /api/summaries/search': async (req, res) => {
+        try {
+            const parsedUrl = url.parse(req.url, true);
+            const q = parsedUrl.query.q || parsedUrl.query.query;
+            const limit = Math.min(parseInt(parsedUrl.query.limit, 10) || 50, 200);
+
+            if (!q || String(q).trim() === '') {
+                return sendJson(res, 400, { error: 'Missing query parameter: q or query (keyword to search in call_summary)' });
+            }
+
+            const results = await db.searchCallSummaries(String(q).trim(), limit);
+            sendJson(res, 200, { results, count: results.length });
+        } catch (error) {
+            logger.error('Search summaries API error:', error);
+            sendJson(res, 500, { error: error.message });
+        }
+    },
+
     // Get call analysis by ID
     'GET /api/calls/:callId': async (req, res, callId) => {
         try {
@@ -354,6 +373,7 @@ export default {
                     logger.info('  POST /api/process - Process single transcription');
                     logger.info('  GET  /api/analytics - Get analytics report');
                     logger.info('  GET  /api/high-priority - Get high-priority calls');
+                    logger.info('  GET  /api/summaries/search?q=keyword - Keyword search in call summaries (FTS)');
                     logger.info('  GET  /api/calls/:callId - Get call analysis by ID');
                     logger.info('  POST /api/transcriptions/bulk - Bulk insert transcriptions');
                     logger.info('  GET  /api/tags/stats - Get tag usage statistics');

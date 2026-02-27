@@ -294,19 +294,17 @@ export const dbOperations = {
             [limit]
         ),
 
-    // Search call summaries with full-text search
+    // Search call summaries with full-text search (uses idx_v2_summary_fts GIN index)
     searchCallSummaries: async (searchTerm, limit = 50) =>
         query(
             `SELECT
                 v2.ringba_row_id,
                 v2.ringba_caller_id,
-                td1.tag_value AS tier1_value,
-                td5.tag_value AS tier5_value,
+                v2.tier1_data->>'value' AS tier1_value,
+                v2.tier5_data->>'value' AS tier5_value,
                 v2.call_summary,
                 ts_rank(to_tsvector('english', COALESCE(v2.call_summary, '')), plainto_tsquery('english', $1)) AS rank
              FROM call_analysis_v2 v2
-             LEFT JOIN tag_definitions td1 ON td1.id = (v2.tier1_data->'value_ids'->>0)::int
-             LEFT JOIN tag_definitions td5 ON td5.id = (v2.tier5_data->'value_ids'->>0)::int
              WHERE to_tsvector('english', COALESCE(v2.call_summary, '')) @@ plainto_tsquery('english', $1)
              ORDER BY rank DESC, v2.processed_at DESC
              LIMIT $2`,

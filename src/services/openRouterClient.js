@@ -211,6 +211,48 @@ const createUserPrompt = (callData) => {
     return `Analyze this call:\n\n${JSON.stringify(callData)}`;
 };
 
+// Check if transcript is valid and meaningful
+const isValidTranscript = (transcript) => {
+    if (!transcript || typeof transcript !== 'string') {
+        return false;
+    }
+
+    const cleaned = transcript.trim();
+
+    // Empty or too short
+    if (cleaned.length < 10) {
+        return false;
+    }
+
+    // Check for common placeholder messages (case-insensitive)
+    const placeholders = [
+        'transcription not available',
+        'transcript not available',
+        'not available',
+        'unavailable',
+        'no transcript',
+        'no transcription',
+        'n/a',
+        'none',
+        'null',
+        'undefined',
+        'error',
+        'failed to transcribe',
+        'transcription failed',
+        'processing',
+        'pending'
+    ];
+
+    const lowerTranscript = cleaned.toLowerCase();
+    for (const placeholder of placeholders) {
+        if (lowerTranscript === placeholder || lowerTranscript.includes(placeholder)) {
+            return false;
+        }
+    }
+
+    return true;
+};
+
 // Build call data object from raw DB row for the prompt.
 // Must match SECTION 2 (INPUT DATA SPECIFICATION) in CALL_TAGGING_SYSTEM_PROMPT_V5.md.
 export const buildCallData = (row) => {
@@ -274,6 +316,7 @@ const buildSystemMessage = (systemPrompt) => {
 
 // Make API request to OpenRouter
 const makeOpenRouterRequest = async (userPrompt, systemPrompt) => {
+    console.log(config.model);
     const requestBody = {
         model: config.model,
         messages: [
@@ -451,8 +494,33 @@ export const analyzeCall = async (callData, systemPrompt) => {
 // The processor groups by campaign and calls this once per unique prompt.
 export const processBatch = async (rows, systemPrompt) => {
     if (!systemPrompt) throw new Error('processBatch: systemPrompt is required');
+
+    // Filter out rows without valid transcripts before processing
+    const validRows = [];
+    const skippedRows = [];
+
+    for (const row of rows) {
+        const transcript = row.transcription || row.transcript || '';
+        if (!isValidTranscript(transcript)) {
+            console.log(`Skipping row ${row.id}: Invalid or unavailable transcript`);
+            skippedRows.push({
+                success: false,
+                rowId: row.id,
+                error: 'Transcript not available or invalid',
+                skipped: true
+            });
+        } else {
+            validRows.push(row);
+        }
+    }
+
+    if (validRows.length === 0) {
+        console.log('No valid transcripts to process in this batch');
+        return { successful: [], failed: skippedRows };
+    }
+
     const results = await Promise.allSettled(
-        rows.map(async (row) => {
+        validRows.map(async (row) => {
             const startTime = Date.now();
 
             try {
@@ -482,19 +550,23 @@ export const processBatch = async (rows, systemPrompt) => {
         .filter(r => r.status === 'fulfilled' && r.value.success)
         .map(r => r.value);
 
-    const failed = results
-        .filter(r => r.status === 'rejected' || (r.status === 'fulfilled' && !r.value.success))
-        .map(r => r.value || { error: r.reason });
+    const failed = [
+        ...skippedRows,
+        ...results
+            .filter(r => r.status === 'rejected' || (r.status === 'fulfilled' && !r.value.success))
+            .map(r => r.value || { error: r.reason })
+    ];
 
     return { successful, failed };
 };
 
-export { RESPONSE_SCHEMA };
+export { RESPONSE_SCHEMA, isValidTranscript };
 
 export default {
     analyzeCall,
     validateAIResponse,
     buildCallData,
     processBatch,
+    isValidTranscript,
     RESPONSE_SCHEMA
 };
