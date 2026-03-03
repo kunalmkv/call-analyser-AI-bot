@@ -233,7 +233,15 @@ const saveV2Result = async (client, result, callTimestamp = null, valueToTagId) 
 
 // Fetch unprocessed rows with all fields needed for V5 prompt
 // FILTER: Only fetches calls on or after 1 Feb 2026 (call_timestamp >= 2026-02-01)
-const fetchUnprocessedRows = async (limit) => {
+const fetchUnprocessedRows = async (limit, excludeIds = []) => {
+    let excludeClause = '';
+    const params = [limit];
+
+    if (excludeIds.length > 0) {
+        params.push(excludeIds);
+        excludeClause = `AND r.id <> ALL($2::integer[])`;
+    }
+
     return db.query(
         `SELECT
             r.id,
@@ -274,9 +282,10 @@ const fetchUnprocessedRows = async (limit) => {
          AND r.transcript != ''
          AND (r.ai_processed = false OR r.ai_processed IS NULL)
          AND r.call_timestamp >= '2026-02-01'::date
+         ${excludeClause}
          ORDER BY r.id ASC
          LIMIT $1`,
-        [limit]
+        params
     );
 };
 
@@ -301,6 +310,7 @@ const getPromptForRow = (row, map) => map.get(row.campaign_id);
 const processSequentialBatches = async (batchSize, totalLimit) => {
     let totalProcessed = 0;
     let batchNumber = 1;
+    let skippedIdsInJob = []; // Track skipped IDs across batches to prevent loops
 
     // Load tag definitions for call_tags mapping (tag_value -> tag_id)
     const tagDefinitions = await db.getTagDefinitions();
@@ -327,7 +337,7 @@ const processSequentialBatches = async (batchSize, totalLimit) => {
         logger.info('='.repeat(60));
 
         try {
-            const rows = await fetchUnprocessedRows(currentBatchSize);
+            const rows = await fetchUnprocessedRows(currentBatchSize, skippedIdsInJob);
 
             if (rows.length === 0) {
                 logger.info('No more unprocessed transcriptions found. Stopping.');
@@ -345,6 +355,7 @@ const processSequentialBatches = async (batchSize, totalLimit) => {
                 const prompt = getPromptForRow(row, promptMap);
                 if (!prompt) {
                     skippedNoPrompt++;
+                    skippedIdsInJob.push(row.id); // Also skip these in future fetches for this job run
                     continue;
                 }
                 if (!promptGroups.has(prompt)) promptGroups.set(prompt, []);
@@ -373,6 +384,7 @@ const processSequentialBatches = async (batchSize, totalLimit) => {
                 logger.info(`Skipped ${skippedCalls.length} calls with invalid transcripts (will retry in future runs if transcript becomes available)`);
                 for (const skipped of skippedCalls) {
                     logger.info(`  Skipped row ${skipped.rowId}: ${skipped.error}`);
+                    skippedIdsInJob.push(skipped.rowId); // Add to exclusion list for this job
                 }
             }
 
